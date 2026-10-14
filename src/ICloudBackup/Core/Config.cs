@@ -43,6 +43,7 @@ public sealed class AppConfig
 
     // Copying
     public int CopyThreads { get; set; } = 4;
+    public int DownloadThreads { get; set; } = 4;
     public int HydrationTimeoutMinutes { get; set; } = 15;
     public int FileSettleSeconds { get; set; } = 15;
     public bool KeepVersions { get; set; } = true;
@@ -51,10 +52,16 @@ public sealed class AppConfig
     // Retries
     public int RetryMaxDelayMinutes { get; set; } = 360;
     public int RetryAlertAfterAttempts { get; set; } = 5;
+    /// <summary>Files waiting on an iCloud download are retried sooner than other failures.</summary>
+    public int DownloadRetryMaxMinutes { get; set; } = 30;
 
     // iCloud
+    /// <summary>Full rescan of the iCloud folders and NAS (does not restart iCloud).</summary>
     public int SyncIntervalMinutes { get; set; } = 60;
-    public bool RestartICloudOnSync { get; set; } = true;
+    /// <summary>Restart iCloud this often to make it pick up changes; 0 = never. Waits until nothing is downloading or copying.</summary>
+    public int ICloudRestartIntervalMinutes { get; set; } = 15;
+    /// <summary>Skip the scheduled restart when no files are waiting on an iCloud download.</summary>
+    public bool ICloudRestartOnlyWhenStuck { get; set; } = false;
     public int ICloudSettleSeconds { get; set; } = 30;
     public bool ICloudWatchdog { get; set; } = true;
     public List<string> ICloudProcessNames { get; set; } = ["iCloudDrive", "iCloudPhotos"];

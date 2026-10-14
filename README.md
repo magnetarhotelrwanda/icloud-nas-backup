@@ -20,7 +20,8 @@ It runs on a Windows machine (typically a VM) with **iCloud for Windows** instal
    - [The copy pipeline (per file)](#the-copy-pipeline-per-file)
    - [Getting files out of iCloud (hydration and pinning)](#getting-files-out-of-icloud-hydration-and-pinning)
    - [Change detection](#change-detection)
-   - [Hourly sync](#hourly-sync)
+   - [Hourly rescan](#hourly-rescan)
+   - [iCloud restarts](#icloud-restarts)
    - [Retries](#retries)
    - [Integrity check](#integrity-check)
    - [Health monitoring](#health-monitoring)
@@ -74,10 +75,13 @@ Only **one instance** can run per user (enforced by a named mutex, `Local\ICloud
                   │                                                                                            │
  iCloud for       │  FileSystemWatcher ──┐                                                                     │
  Windows ──sync──►│  (per job)           │ debounce (FileSettleSeconds)                                        │
- (local folders)  │                      ▼                                                                     │
-                  │  Scheduler (2 s tick) ──► Work queue (dedup) ──► N copy workers ──► NAS (SMB)              │
-                  │   • hourly sync            ▲                       │  hydrate → copy → verify → swap        │
-                  │   • retry due failures ────┘                       ▼                                       │
+ (local folders)  │                      ▼                       online-only? ──► Download queue ──► M download │
+                  │  Scheduler (2 s tick) ──► Copy queue (dedup) ◄───────────────────── on disk ◄──── workers  │
+                  │   • hourly rescan          ▲      │                                    (CfHydratePlaceholder)│
+                  │   • iCloud restart (15 m)  │      ▼                                                        │
+                  │   • retry due failures ────┘   N copy workers ──► copy → verify → swap ──► NAS (SMB)        │
+                  │                                                    │                                       │
+                  │                                                    ▼                                       │
                   │   • NAS / iCloud / disk checks              SQLite state.db                                │
                   │   • integrity schedule                             │                                       │
                   │   • daily summary                                  ▼                                       │
@@ -89,9 +93,9 @@ Only **one instance** can run per user (enforced by a named mutex, `Local\ICloud
 | Class | File | Responsibility |
 |---|---|---|
 | `Program` | `Program.cs` | Single-instance check, loads config, opens the database, starts the engine and the tray. |
-| `BackupEngine` | `Core/BackupEngine.cs` | The service: watchers, queue, workers, scheduler, sync, retries, integrity check, health checks, daily summary. |
+| `BackupEngine` | `Core/BackupEngine.cs` | The service: watchers, the copy queue and copy workers, the download queue and download workers, scheduler, rescans, iCloud restarts, retries, integrity check, health checks, daily summary. |
 | `FileOps` | `Core/FileOps.cs` | Folder walking, SHA-256 hashing, verified copy, versioning, filename case fix, reachability with timeout. |
-| `CloudFiles` | `Core/CloudFiles.cs` | P/Invoke into `cldapi.dll`: download a placeholder (`CfHydratePlaceholder`) and pin a folder (`CfSetPinState`), with `attrib +P` as a fallback. |
+| `CloudFiles` | `Core/CloudFiles.cs` | P/Invoke into `cldapi.dll`: download a placeholder (`CfHydratePlaceholder`, falling back to reading the whole file) and pin a folder (`CfSetPinState`, falling back to `attrib +P`). Throws `CloudDownloadException` with the real Windows error. |
 | `ICloudManager` | `Core/ICloudManager.cs` | Kills and relaunches the iCloud processes. Finds launchable iCloud apps with `Get-StartApps`. |
 | `DiscordNotifier` | `Core/DiscordNotifier.cs` | Batched and immediate webhook messages, rate-limit handling, message splitting. |
 | `StateDb` | `Core/StateDb.cs` | SQLite record of every file: size, mtime, hash, status, retry state. |
@@ -108,8 +112,9 @@ Only **one instance** can run per user (enforced by a named mutex, `Local\ICloud
    4. On first run, opens Settings and **does not start the engine**. Otherwise starts the engine and sends a "started" Discord message.
 2. **Engine start** (`BackupEngine.Start`):
    1. Creates a FileSystemWatcher for each enabled job.
-   2. Starts `CopyThreads` worker tasks and the scheduler task.
-   3. Schedules a sync to run immediately (reason: `startup`).
+   2. Starts `CopyThreads` copy workers, `DownloadThreads` download workers and the scheduler task.
+   3. Schedules a rescan to run immediately (reason: `startup`).
+   4. Schedules the first iCloud restart `ICloudRestartIntervalMinutes` from now (not at startup).
 3. **Saving settings** saves `config.json`, updates the start-with-Windows registry entry, then **stops and restarts the engine** with the new config. Copies in progress are cancelled; their partial files are deleted and the files are retried.
 4. **Exit** (tray menu, **Exit**):
    1. Sends a "stopped" message.
@@ -124,7 +129,7 @@ Each queued file goes through `BackupEngine.ProcessAsync`:
 
 1. **Skip check.** If the database has the file as `Ok` with the same size and modified time (and the item isn't forced), there's nothing to do.
 2. **NAS check.** If the job's NAS is marked offline, the file is recorded as failed without counting an attempt. It's picked up again when the NAS comes back.
-3. **Hydrate.** If the file is still a cloud placeholder (it has the `RECALL_ON_DATA_ACCESS`, `RECALL_ON_OPEN` or `OFFLINE` attribute), the worker calls `CfHydratePlaceholder` and waits up to `HydrationTimeoutMinutes` for iCloud to download it.
+3. **Hand off if online-only.** If the file is still a cloud placeholder (it has the `RECALL_ON_DATA_ACCESS`, `RECALL_ON_OPEN` or `OFFLINE` attribute), the copy worker sends it to the **download queue** and moves on to the next file. A download worker gets it from iCloud and then puts it back on the copy queue. See below.
 4. **Adopt an existing copy.** If the database has no hash for this file, or the item is forced, and a same-size file already exists on the NAS, both files are hashed.
    - If the hashes match, the NAS file is **adopted**: no copy, filename case fixed, mtime set, recorded as `Ok`.
    - This is how an existing backup (e.g. from older scripts) is taken over without copying everything again.
@@ -146,14 +151,23 @@ The NAS folder tree mirrors the iCloud folder tree, relative to each job's root,
 
 ### Getting files out of iCloud (hydration and pinning)
 
-iCloud for Windows uses **Cloud Files placeholders**: a file can appear in Explorer while its data is still in iCloud. Copying such a file can fail or time out, so the app handles it in two layers:
+iCloud for Windows uses **Cloud Files placeholders**: a file can appear in Explorer while its data is still in iCloud. Copying such a file can fail or time out, so downloading is a separate stage with its own threads.
 
-1. **Pinning (whole folder).** When a job has **Keep files on this device** on, each sync checks whether any file is unpinned or still a placeholder. If so, it calls `CfSetPinState(PINNED, RECURSE)` on the job's root folder. This is the same as right-clicking the folder and choosing *Always keep on this device*.
-   - iCloud then downloads everything in the background and keeps it downloaded. New files inherit the pin.
-   - If the API call is refused, it falls back to `attrib +P -U /S /D "<folder>\*"`.
-2. **Per-file download (just in time).** Before copying, any file still a placeholder is downloaded explicitly with `CfHydratePlaceholder`, with a timeout.
-   - If that API returns an error, the copy's own read still triggers the download as a fallback.
-   - If iCloud doesn't deliver the file within the timeout, the file goes to retry.
+**1. Pinning (whole folder, background).** When a job has **Keep files on this device** on, each rescan checks whether any file is unpinned or still a placeholder. If so, it calls `CfSetPinState(PINNED, RECURSE)` on the job's root folder. This is the same as right-clicking the folder and choosing *Always keep on this device*.
+- If the API is refused, it falls back to `attrib +P -U /S /D "<folder>\*"`.
+- Pinning only records the *intent*: iCloud decides when, or whether, to download pinned files. In practice iCloud for Windows doesn't reliably do this, which is why step 2 exists.
+
+**2. Download workers (per file, active).** Every placeholder that needs backing up goes on the download queue. `DownloadThreads` workers (default 4) each take one file and call **`CfHydratePlaceholder(file, 0, CF_EOF)`**.
+- This makes Windows ask iCloud for the file's data and **blocks until the whole file is on disk**. It's the same mechanism used when you open an online-only file in an app.
+- The file handle is opened with `FILE_READ_DATA`, which the API requires.
+- **Timeout:** if iCloud doesn't deliver within `HydrationTimeoutMinutes`, the call is cancelled with `CancelIoEx`, so the thread is freed.
+- **Fallback:** if the API is refused for a reason other than iCloud being down, the worker forces the download by reading the file end to end.
+- **Confirmation:** after the call, the file's attributes are re-read. If it is still online-only, that counts as a failure.
+- **Success:** the file goes back on the copy queue.
+- **Failure:** the file is recorded as `Failed` with an error starting `iCloud download …`. It's retried on the shorter download back-off (capped at `DownloadRetryMaxMinutes`, default 30 min), and retried immediately after the next iCloud restart.
+- **iCloud not connected:** "the cloud file provider is not running" (Win32 362 or 404) means iCloud's sync engine isn't connected. The watchdog then schedules an iCloud restart.
+
+Copy threads never wait on iCloud, so files that are already local keep flowing to the NAS while others download. The Status tab shows how many files are waiting on an iCloud download.
 
 ### Change detection
 
@@ -167,24 +181,31 @@ There are three layers, from fastest to most thorough:
 
 A file counts as changed when its **size or last-write time** differs from what was recorded at its last successful backup.
 
-### Hourly sync
+### Hourly rescan
 
-`RunSyncAsync` runs on startup, every `SyncIntervalMinutes` (minimum 5), on **Sync now**, and when the scheduler asks for one. Only one sync or rescan runs at a time.
+`RunSyncAsync` runs on startup, every `SyncIntervalMinutes` (default 60, minimum 5), on **Sync now**, and when the scheduler asks for one. It **does not restart iCloud**; restarts have their own timer (next section). Only one rescan, job rescan or iCloud restart runs at a time.
 
-1. **Restart iCloud** (if `RestartICloudOnSync`):
-   1. Pauses the workers from taking new files.
-   2. Waits up to 10 minutes for copies in progress to finish.
-   3. Kills the processes in `ICloudProcessNames`, waits 5 s, and relaunches any that didn't restart on their own via `explorer.exe shell:AppsFolder\<AppID>` (found with `Get-StartApps`).
-   4. Resumes the workers and waits `ICloudSettleSeconds`.
-
-   If restarting is off, it only launches iCloud when nothing is running.
+1. If no iCloud process is running, launches iCloud.
 2. **For each enabled job** (`ScanJobAsync`):
    1. Walks the iCloud folder. It descends into every folder (including placeholder folders) and never skips hidden or system files, except names matching `ExcludePatterns`.
-   2. Queues every file that is new, changed, previously deleted, or failed and past its retry time.
+   2. Queues every file that is new, changed, previously deleted, or failed and past its retry time. Online-only files go on to the download queue from there.
    3. Records files that have disappeared from iCloud as `Deleted`. This is skipped when the safety rail trips; see [Deletions and safety rails](#deletions-and-safety-rails).
    4. Walks the NAS folder, skipping the `.versions` folder and `*.icbpartial` files. Every unchanged `Ok` file whose NAS copy is missing or a different size is queued with **force**.
    5. Pins the folder if anything was unpinned or still a placeholder.
-3. Records `last_sync` and schedules the next sync. Sends a Discord summary if `NotifySyncSummary` is on, or if anything was deleted or missing on the NAS.
+3. Records `last_sync` and schedules the next rescan. Sends a Discord summary if `NotifySyncSummary` is on, or if anything was deleted or missing on the NAS.
+
+### iCloud restarts
+
+`RunICloudRestartAsync` runs every `ICloudRestartIntervalMinutes` (default **15**, 0 = never). The first one runs that long after the app starts. It **never interrupts a download or copy**:
+
+1. If `ICloudRestartOnlyWhenStuck` is on and no file is waiting on an iCloud download, the restart is skipped.
+2. New downloads and copies are held back (nothing new is started).
+3. Waits until **every** active download and copy has finished, for up to `max(30, HydrationTimeoutMinutes + 5)` minutes. If work is still running after that, this restart is **skipped** and retried 5 minutes later. Nothing is killed mid-transfer.
+4. Kills the processes in `ICloudProcessNames`, waits 5 s, and relaunches any that didn't restart on their own via `explorer.exe shell:AppsFolder\<AppID>` (found with `Get-StartApps`).
+5. Waits `ICloudSettleSeconds` (still holding new work), then resumes.
+6. Immediately retries every file whose last error was an iCloud download failure.
+
+Routine restarts are logged but not sent to Discord.
 
 ### Retries
 
@@ -194,13 +215,13 @@ When a file fails (`HandleFailureAsync`):
 - **NAS unreachable:** the job's NAS is marked offline and the file is recorded as `Failed` **without** counting an attempt and with no retry time. The resync that runs when the NAS comes back picks it up.
 - **Anything else:**
   - The attempt count goes up by one.
-  - The next retry is set **min(2^(attempts-1) minutes, RetryMaxDelayMinutes)** away: 1, 2, 4, 8, 16, 32, 64, 128, 256, then 360 min…
+  - The next retry is set **min(2^(attempts-1) minutes, cap)** away, where the cap is `RetryMaxDelayMinutes` (default 360) for ordinary failures and `DownloadRetryMaxMinutes` (default 30) for iCloud download failures. So: 1, 2, 4, 8, 16, 30, 30… minutes for downloads, and 1, 2, 4 … 256, then 360 minutes for everything else.
   - The error is stored.
   - A failure event goes into the next batched Discord message.
 - **Alert:** when the attempt count reaches exactly `RetryAlertAfterAttempts`, a separate alert is sent immediately.
 - **No limit:** a file keeps retrying forever at the maximum interval until it succeeds.
 
-The scheduler queues failed files that are due every 30 s. **Retry selected / Retry all** in the UI sets their retry time to now and queues them immediately.
+The scheduler queues failed files that are due every 30 s. Each iCloud restart also retries all download failures straight away. **Retry selected / Retry all** in the UI sets their retry time to now and queues them immediately.
 
 ### Integrity check
 
@@ -234,9 +255,10 @@ The scheduler ticks every 2 s:
 | NAS reachable | 30 s | `Directory.Exists(dest)` with a 15 s timeout. If the folder is missing but the drive or share root is reachable, the folder is created. Copying pauses while offline. Discord is told when the NAS goes offline and when it comes back; coming back also triggers a rescan. |
 | Watcher events | 2 s | Queues debounced files and runs pending job rescans. |
 | Due retries | 30 s | Queues failed files whose retry time has passed. |
-| iCloud watchdog | 60 s | Any process in `ICloudProcessNames` that was seen running and has now stopped is relaunched, and Discord is told. Skipped while a sync is deliberately restarting iCloud. |
+| iCloud watchdog | 60 s | Acts only when **none** of the processes in `ICloudProcessNames` is running (after iCloud was seen running at least once), or when a download reported that iCloud's sync engine isn't connected. A full stop → launches iCloud, and Discord is told once per outage and again when it recovers. Not connected → schedules a clean iCloud restart. At most one action every 10 minutes. Skipped during a deliberate restart. A single iCloud process coming and going on its own is normal and ignored. |
 | Disk space | 10 min | Alerts once when free space on a source drive falls below `LowDiskSpaceGb`. The alert re-arms once free space is back above 110 % of the threshold. |
-| Sync due | each tick | Starts the hourly sync |
+| Rescan due | each tick | Starts the hourly rescan |
+| iCloud restart due | each tick | Starts the 15-minute iCloud restart |
 | Integrity due | each tick | See above |
 | Daily summary | each tick | Once per day during hour `DailySummaryHour` |
 
@@ -312,16 +334,19 @@ All of these are editable in the **Settings** tab, which is the recommended way.
 | Key | Default | Meaning |
 |---|---|---|
 | `CopyThreads` | 4 | Parallel copy workers (1–32). Also the parallelism of the integrity check. |
-| `HydrationTimeoutMinutes` | 15 | Maximum wait for iCloud to download one file |
+| `DownloadThreads` | 4 | Parallel iCloud downloads (1–32) |
+| `HydrationTimeoutMinutes` | 15 | Maximum wait for iCloud to download one file. The call is then cancelled and retried later. |
 | `FileSettleSeconds` | 15 | Quiet period after a watcher event before the file is queued |
 | `KeepVersions` | true | Move the previous NAS copy to `.versions` when a file changes |
 | `VersionsFolderName` | `.versions` | Folder at each NAS job root. Ignored by all scans. |
 | `RetryMaxDelayMinutes` | 360 | Upper limit on the retry back-off |
 | `RetryAlertAfterAttempts` | 5 | Send the "keeps failing" alert at this attempt |
-| `SyncIntervalMinutes` | 60 | Full sync interval (minimum 5) |
-| `RestartICloudOnSync` | true | Restart iCloud at each sync to force it to pick up changes |
-| `ICloudSettleSeconds` | 30 | Wait after restarting iCloud |
-| `ICloudWatchdog` | true | Relaunch iCloud processes that stop |
+| `DownloadRetryMaxMinutes` | 30 | Upper limit on the retry back-off for iCloud download failures |
+| `SyncIntervalMinutes` | 60 | Full rescan interval (minimum 5). Doesn't restart iCloud. |
+| `ICloudRestartIntervalMinutes` | 15 | Restart iCloud this often (0 = never). Waits for active downloads and copies to finish. |
+| `ICloudRestartOnlyWhenStuck` | false | Skip a scheduled restart when nothing is waiting on an iCloud download |
+| `ICloudSettleSeconds` | 30 | Wait after restarting iCloud before resuming work |
+| `ICloudWatchdog` | true | Relaunch iCloud when it has stopped completely |
 | `ICloudProcessNames` | `iCloudDrive`, `iCloudPhotos` | Process names (without `.exe`) to restart and watch |
 | `IntegrityCheckIntervalDays` | 7 | 0 turns off automatic checks |
 | `IntegrityCheckHour` | 3 | Local hour (0–23) when an automatic check may start |
@@ -391,7 +416,7 @@ Deleting `state.db` is safe: on the next start every file is re-checked by hash 
 
 | Tab | Contents |
 |---|---|
-| Status | Current activity, queue length, totals for this session, last and next sync, last integrity result. Buttons: Sync now, Pause, Run integrity check, Retry all failed, Send summary to Discord, Open logs, Open integrity reports. Per-job table (NAS online, files backed up, failing). Live table of files being worked on, with stage and percentage. |
+| Status | Current activity, files queued to copy and waiting on an iCloud download, totals for this session, last and next rescan, next iCloud restart, last integrity result. Buttons: Sync now, Pause, Run integrity check, Retry all failed, Send summary to Discord, Open logs, Open integrity reports. Per-job table (NAS online, files backed up, failing). Live table of files being worked on, with stage and percentage. |
 | Activity | Live log (last 2,000 non-debug lines), coloured by level, with auto-scroll |
 | Failed files | Every file in `Failed` state with attempts, next retry and last error. Retry selected / Retry all. |
 | Settings | Jobs (add, edit, remove) and every option in the [configuration reference](#configuration-reference). **Send test** for the webhook. **Save and apply** restarts the engine. **Undo changes** reloads the saved settings. |
@@ -443,15 +468,20 @@ Files already present are adopted by hash. Anything missing is copied.
 | Symptom / log line | Cause | Fix |
 |---|---|---|
 | `source folder not found` | iCloud not signed in, a feature turned off, or the path changed | Check iCloud for Windows and the job's iCloud folder |
-| `iCloud did not finish downloading the file within N min` | iCloud slow, stuck or signed out | Retries happen automatically. Check that iCloud is running. Raise `HydrationTimeoutMinutes` for very large videos. |
-| `CfHydratePlaceholder returned 0x…` (debug) | The API refused; the read fallback is used | Usually harmless |
-| `Cloud Files pin API returned 0x… - falling back to attrib +P` then `attrib +P exited …` | iCloud doesn't accept pinning for that folder | Set *Always keep on this device* manually in Explorer, or turn **Keep files local** off (per-file download still works) |
+| `iCloud download timed out - iCloud did not deliver the file within N min` | iCloud slow, stuck or signed out | Retried automatically on the download back-off and after each iCloud restart. Check that iCloud is running and signed in. Raise `HydrationTimeoutMinutes` for very large videos. |
+| `iCloud download failed - iCloud isn't running or connected` | iCloud's sync engine is disconnected | The watchdog schedules an iCloud restart automatically. If it keeps happening, sign out of iCloud and back in. |
+| `CfHydratePlaceholder refused (…) - forcing the download by reading the file` | The download API refused a file | The read fallback usually works. If the same file keeps failing, open it once in Explorer to see iCloud's own error. |
+| `iCloud download incomplete - iCloud reported success but the file is still online-only` | iCloud didn't actually deliver the data | Retried automatically. Persistent cases are usually files iCloud itself can't download; check them on iCloud.com. |
+| `Cloud Files pin API refused …` then `attrib +P exited …` | iCloud doesn't accept pinning for that folder | Set *Always keep on this device* manually in Explorer, or turn **Keep files local** off. The download workers still fetch each file. |
+| `iCloud restart skipped - N download(s)/copy(s) still running` | Large transfers in progress | Normal. The restart retries in 5 minutes. |
+| Copies interrupted around iCloud restarts | Should no longer happen in v1.1.0+ (restarts wait for all active work) | Check that you're on v1.1.0 or later (window title) |
 | `NAS destination not reachable` | Share down, credentials, or drive not mapped | Fix the share. The app resumes and rescans by itself. Prefer UNC paths over mapped drives. |
 | `NAS copy failed verification` | Network or NAS corruption during the write | Retried automatically. If it keeps happening, check the NAS disks and network. |
 | `only N files found but M were backed up before` | iCloud signed out or re-indexing | Fix iCloud. Nothing was removed. |
-| `No iCloud apps found in the Start menu` | iCloud isn't a Store install, or `Get-StartApps` is unavailable | Relaunch iCloud manually, or set `RestartICloudOnSync` to false |
+| `No iCloud apps found in the Start menu` | iCloud isn't a Store install, or `Get-StartApps` is unavailable | Relaunch iCloud manually, or set `ICloudRestartIntervalMinutes` to 0 |
 | `iCloud (...) has stopped and could not be relaunched` | As above | As above |
 | Lots of `Source file changed size while it was being copied` | A file is being written while it's copied | Raise `FileSettleSeconds` |
+| Tray shows "Working - N downloading from iCloud" for a long time | A large backlog of online-only files | Normal on first run or after "Free up space". Raise `DownloadThreads` if iCloud keeps up. |
 | Windows shows "*ICloudBackup is downloading files*" or a blocked-app prompt | Windows' per-app download control for cloud files | Allow it, or re-enable it under Settings → Privacy → Automatic file downloads |
 | `Could not decrypt stored Discord webhook` | Config moved to another user or machine | Re-enter the webhook in Settings |
 | App won't start: "already running" | Another instance is in the tray | Use that one, or end it in Task Manager |
@@ -469,7 +499,7 @@ To see more detail, open the log file. Debug-level lines are written to the file
 - **Folder name casing**: filename casing is corrected on the NAS, but folder casing is left as created. Windows paths are case-insensitive.
 - **Change detection uses size and mtime.** An in-place edit that keeps both identical isn't seen until the next integrity check.
 - **Hashing reads over SMB** may be served from the Windows client cache, so the verify step mainly proves the data reached the SMB client and server intact. The scheduled integrity check is the deeper check.
-- **iCloud restart heuristics**: relaunching uses the Start-menu (Store) app entries that match the names in `ICloudProcessNames`. Non-Store installs may need `RestartICloudOnSync = false`.
+- **iCloud restart heuristics**: relaunching uses the Start-menu (Store) app entries that match the names in `ICloudProcessNames`. Non-Store installs may need `ICloudRestartIntervalMinutes = 0`.
 - **The exe is unsigned**, so SmartScreen will warn on first run.
 
 ---
@@ -515,3 +545,17 @@ src/ICloudBackup/
     ├── JobEditForm.cs       add/edit job dialog
     └── TrayContext.cs       tray icon + menu, status icons, start-with-Windows
 ```
+
+---
+
+## Changelog
+
+**v1.1.0**
+- Fixed: iCloud downloads (`CfHydratePlaceholder`) and folder pinning (`CfSetPinState`) were opened without the `READ_DATA` access the API requires, so they always failed and fell back quietly.
+- New: downloading from iCloud is a separate stage with its own threads (`DownloadThreads`). Copy threads never wait on iCloud. Timeouts cancel the download properly, and failures report the real Windows error.
+- New: iCloud restarts run on their own timer (`ICloudRestartIntervalMinutes`, default 15) instead of with the hourly rescan. They wait for all active downloads and copies to finish, and are skipped rather than interrupting work. Download failures are retried straight after each restart.
+- Fixed: the watchdog relaunched iCloud whenever any single iCloud process was missing, which could happen every minute or two. It now acts only when iCloud has stopped completely (or reports its sync engine as disconnected), at most once every 10 minutes.
+- New: iCloud download failures retry on a shorter back-off (`DownloadRetryMaxMinutes`, default 30).
+- Removed: `RestartICloudOnSync`, replaced by `ICloudRestartIntervalMinutes`.
+
+**v1.0.0**: first release.

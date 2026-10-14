@@ -5,12 +5,23 @@ using Microsoft.Win32.SafeHandles;
 
 namespace ICloudBackup.Core;
 
+/// <summary>A file iCloud couldn't (or didn't) download. Messages start with "iCloud download" so they can be recognised later.</summary>
+public sealed class CloudDownloadException(string message, int win32Error = 0) : IOException(message)
+{
+    public int Win32Error { get; } = win32Error;
+
+    /// <summary>iCloud's sync engine isn't connected - relaunching iCloud is the fix.</summary>
+    public bool ProviderNotRunning => Win32Error is CloudFiles.ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING or CloudFiles.ERROR_CLOUD_FILE_PROVIDER_TERMINATED;
+}
+
 /// <summary>
 /// Windows Cloud Files API (cldapi.dll) - what iCloud for Windows uses for its "online-only" placeholders.
 /// Lets us pin folders ("Always keep on this device") and explicitly download individual files.
 /// </summary>
 public static class CloudFiles
 {
+    public const string DownloadErrorPrefix = "iCloud download";
+
     private const int FILE_ATTRIBUTE_OFFLINE = 0x00001000;
     private const int FILE_ATTRIBUTE_PINNED = 0x00080000;
     private const int FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x00040000;
@@ -19,10 +30,17 @@ public static class CloudFiles
     private const int CF_PIN_STATE_PINNED = 1;
     private const int CF_SET_PIN_FLAG_RECURSE = 0x1;
     private const int CF_HYDRATE_FLAG_NONE = 0;
+    private const long CF_EOF = -1;
 
-    private const int ERROR_NOT_A_CLOUD_FILE = 0x178;
+    public const int ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING = 362;
+    public const int ERROR_NOT_A_CLOUD_FILE = 376;
+    public const int ERROR_CLOUD_FILE_PROVIDER_TERMINATED = 404;
+    private const int ERROR_OPERATION_ABORTED = 995;
+
+    // Both CfHydratePlaceholder and CfSetPinState require READ_DATA (or WRITE_DAC) access on the handle.
+    // FILE_READ_DATA and FILE_LIST_DIRECTORY are the same bit.
+    private const uint FILE_READ_DATA = 0x0001;
     private const uint FILE_READ_ATTRIBUTES = 0x0080;
-    private const uint FILE_WRITE_ATTRIBUTES = 0x0100;
     private const uint FILE_SHARE_ALL = 0x7;
     private const uint OPEN_EXISTING = 3;
     private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
@@ -30,6 +48,9 @@ public static class CloudFiles
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security,
         uint disposition, uint flags, IntPtr template);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CancelIoEx(SafeFileHandle handle, IntPtr overlapped);
 
     [DllImport("cldapi.dll")]
     private static extern int CfHydratePlaceholder(SafeFileHandle fileHandle, long startingOffset, long length,
@@ -52,34 +73,83 @@ public static class CloudFiles
         : path.StartsWith(@"\\") ? @"\\?\UNC\" + path[2..]
         : @"\\?\" + path;
 
+    /// <summary>Win32 error code from an HRESULT (0x8007xxxx), or the value itself if it already is one.</summary>
+    private static int Win32Code(int hr) => (hr & unchecked((int)0xFFFF0000)) == unchecked((int)0x80070000) ? hr & 0xFFFF : hr;
+
+    public static string Describe(int win32) => $"{new Win32Exception(win32).Message} (error {win32})";
+
     /// <summary>
-    /// Blocks until iCloud has downloaded the whole file. Throws on timeout or a hard failure.
-    /// If the explicit API call is refused we fall back silently: reading the file during the copy also triggers the download.
+    /// Downloads the whole file from iCloud and waits until it's on disk. Uses CfHydratePlaceholder (the same call
+    /// Explorer's "Always keep on this device" ends up making); if that is refused for a reason other than iCloud
+    /// being down, falls back to reading the file end to end, which also forces the download.
+    /// Throws <see cref="CloudDownloadException"/> on failure or timeout.
     /// </summary>
     public static async Task HydrateAsync(string path, TimeSpan timeout, CancellationToken ct)
     {
-        var task = Task.Run(() =>
-        {
-            using var h = CreateFileW(LongPath(path), FILE_READ_ATTRIBUTES, FILE_SHARE_ALL, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
-            if (h.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error(), $"Could not open file for download");
-            var hr = CfHydratePlaceholder(h, 0, -1, CF_HYDRATE_FLAG_NONE, IntPtr.Zero);
-            return hr;
-        }, CancellationToken.None);
+        var started = Stopwatch.StartNew();
+        var hr = await HydrateWithApiAsync(path, timeout, ct);
 
-        int result;
+        if (hr != 0)
+        {
+            var code = Win32Code(hr);
+            if (code == ERROR_NOT_A_CLOUD_FILE) return;
+            if (code is ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING or ERROR_CLOUD_FILE_PROVIDER_TERMINATED)
+                throw new CloudDownloadException($"{DownloadErrorPrefix} failed - iCloud isn't running or connected: {Describe(code)}", code);
+
+            Log.Warn($"CfHydratePlaceholder refused ({Describe(code)}) for {path} - forcing the download by reading the file");
+            var remaining = timeout - started.Elapsed;
+            if (remaining < TimeSpan.FromMinutes(1)) remaining = TimeSpan.FromMinutes(1);
+            await HydrateByReadingAsync(path, remaining, ct);
+        }
+
+        var attrs = File.GetAttributes(path);
+        if (IsPlaceholder(attrs))
+            throw new CloudDownloadException($"{DownloadErrorPrefix} incomplete - iCloud reported success but the file is still online-only");
+    }
+
+    private static async Task<int> HydrateWithApiAsync(string path, TimeSpan timeout, CancellationToken ct)
+    {
+        using var h = CreateFileW(LongPath(path), FILE_READ_DATA | FILE_READ_ATTRIBUTES, FILE_SHARE_ALL, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+        if (h.IsInvalid)
+        {
+            var err = Marshal.GetLastWin32Error();
+            throw new CloudDownloadException($"{DownloadErrorPrefix} failed - could not open the file: {Describe(err)}", err);
+        }
+
+        var call = Task.Run(() => CfHydratePlaceholder(h, 0, CF_EOF, CF_HYDRATE_FLAG_NONE, IntPtr.Zero), CancellationToken.None);
         try
         {
-            result = await task.WaitAsync(timeout, ct);
+            return await call.WaitAsync(timeout, ct);
         }
-        catch (TimeoutException)
+        catch (Exception ex) when (ex is TimeoutException or OperationCanceledException)
         {
-            // The native call keeps running in the background; iCloud may still finish it and the retry will pick it up.
-            throw new TimeoutException($"iCloud did not finish downloading the file within {timeout.TotalMinutes:0} min");
+            // Cancel the blocked native call so it doesn't hold a download slot (and the handle) forever.
+            CancelIoEx(h, IntPtr.Zero);
+            try { await call.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None); } catch { }
+            if (ex is OperationCanceledException) throw;
+            throw new CloudDownloadException($"{DownloadErrorPrefix} timed out - iCloud did not deliver the file within {timeout.TotalMinutes:0} min");
         }
+    }
 
-        if (result != 0 && (result & 0xFFFF) != ERROR_NOT_A_CLOUD_FILE)
+    private static async Task HydrateByReadingAsync(string path, TimeSpan timeout, CancellationToken ct)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(timeout);
+        try
         {
-            Log.Debug($"CfHydratePlaceholder returned 0x{result:X8} for {path} - falling back to read-through download");
+            await using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete,
+                1 << 20, FileOptions.SequentialScan | FileOptions.Asynchronous);
+            var buffer = new byte[1 << 20];
+            while (await fs.ReadAsync(buffer, cts.Token) > 0) { }
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new CloudDownloadException($"{DownloadErrorPrefix} timed out - iCloud did not deliver the file within {timeout.TotalMinutes:0} min");
+        }
+        catch (IOException ex) when (ex is not CloudDownloadException)
+        {
+            var code = Win32Code(ex.HResult);
+            throw new CloudDownloadException($"{DownloadErrorPrefix} failed - {ex.Message}", code);
         }
     }
 
@@ -91,7 +161,7 @@ public static class CloudFiles
     {
         var hr = await Task.Run(() =>
         {
-            using var h = CreateFileW(LongPath(folder), FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, FILE_SHARE_ALL,
+            using var h = CreateFileW(LongPath(folder), FILE_READ_DATA | FILE_READ_ATTRIBUTES, FILE_SHARE_ALL,
                 IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
             if (h.IsInvalid) return Marshal.GetHRForLastWin32Error();
             return CfSetPinState(h, CF_PIN_STATE_PINNED, CF_SET_PIN_FLAG_RECURSE, IntPtr.Zero);
@@ -99,7 +169,7 @@ public static class CloudFiles
 
         if (hr == 0) return true;
 
-        Log.Warn($"Cloud Files pin API returned 0x{hr:X8} for {folder} - falling back to attrib +P");
+        Log.Warn($"Cloud Files pin API refused for {folder}: {Describe(Win32Code(hr))} - falling back to attrib +P");
         return await PinWithAttribAsync(folder, ct);
     }
 

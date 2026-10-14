@@ -36,6 +36,8 @@ public sealed class MainForm : Form
     private List<BackupJob> _editJobs = [];
     private readonly ListView _jobsEdit = MakeList(("Name", 140), ("Enabled", 60), ("Keep local", 75), ("iCloud folder", 300), ("NAS folder", 300));
     private readonly NumericUpDown _threads = Num(1, 32);
+    private readonly NumericUpDown _downloadThreads = Num(1, 32);
+    private readonly NumericUpDown _downloadRetryMax = Num(1, 1440);
     private readonly NumericUpDown _hydrationTimeout = Num(1, 240);
     private readonly NumericUpDown _settle = Num(1, 600);
     private readonly CheckBox _keepVersions = Check("Keep the previous version on the NAS when a file changes (in a .versions folder)");
@@ -43,7 +45,8 @@ public sealed class MainForm : Form
     private readonly NumericUpDown _retryMax = Num(1, 1440);
     private readonly NumericUpDown _retryAlert = Num(1, 100);
     private readonly NumericUpDown _syncInterval = Num(5, 1440);
-    private readonly CheckBox _restartICloud = Check("Restart iCloud on each sync (forces it to pull down new files)");
+    private readonly NumericUpDown _restartInterval = Num(0, 1440);
+    private readonly CheckBox _restartOnlyStuck = Check("Only restart when files are waiting on an iCloud download");
     private readonly NumericUpDown _icloudSettle = Num(0, 600);
     private readonly CheckBox _watchdog = Check("Relaunch iCloud automatically if it stops running");
     private readonly TextBox _processNames = new() { Width = 300 };
@@ -208,9 +211,10 @@ public sealed class MainForm : Form
         var lastIntegrity = e.Db.GetMeta("last_integrity");
         var integrityText = DateTime.TryParse(lastIntegrity, out var li) ? $"{When(li)} - {e.Db.GetMeta("last_integrity_result")}" : "never";
         _lblDetails.Text =
-            $"Queue: {e.QueueLength:N0} file(s) waiting     This session: {e.SessionCopied:N0} copied ({FileOps.FormatBytes(e.SessionBytes)}), " +
+            $"Queue: {e.QueueLength:N0} to copy, {e.DownloadQueueLength:N0} waiting on iCloud download     This session: {e.SessionCopied:N0} copied ({FileOps.FormatBytes(e.SessionBytes)}), " +
             $"{e.SessionVerified:N0} verified already on NAS, {e.SessionFailed:N0} failed attempts\n" +
-            $"Last sync: {When(e.LastSync)}     Next sync: {(e.NextSync == DateTime.MaxValue ? "running now" : When(e.NextSync))}\n" +
+            $"Last rescan: {When(e.LastSync)}     Next rescan: {(e.NextSync == DateTime.MaxValue ? "running now" : When(e.NextSync))}     " +
+            $"Next iCloud restart: {(e.NextICloudRestart == DateTime.MaxValue ? (e.Config.ICloudRestartIntervalMinutes > 0 ? "in progress" : "off") : When(e.NextICloudRestart))}\n" +
             $"Last integrity check: {integrityText}";
 
         _btnPause.Text = e.UserPaused ? "Resume" : "Pause";
@@ -385,7 +389,8 @@ public sealed class MainForm : Form
         flow.Controls.Add(jobsBox);
 
         var copyBox = Group("Copying", out var ct);
-        Row(ct, "Files copied at the same time", _threads);
+        Row(ct, "Files copied to the NAS at the same time", _threads);
+        Row(ct, "Files downloaded from iCloud at the same time", _downloadThreads);
         Row(ct, "Give up waiting for an iCloud download after (minutes)", _hydrationTimeout);
         Row(ct, "Wait for a changed file to settle before copying (seconds)", _settle);
         Row(ct, "", _keepVersions);
@@ -394,12 +399,14 @@ public sealed class MainForm : Form
 
         var retryBox = Group("Retries", out var rt);
         Row(rt, "Longest gap between retries (minutes)", _retryMax);
+        Row(rt, "Longest gap between retries for files waiting on iCloud (minutes)", _downloadRetryMax);
         Row(rt, "Send an alert after this many failed attempts", _retryAlert);
         flow.Controls.Add(retryBox);
 
         var icloudBox = Group("iCloud", out var it);
-        Row(it, "Full sync every (minutes)", _syncInterval);
-        Row(it, "", _restartICloud);
+        Row(it, "Full rescan of iCloud and NAS every (minutes)", _syncInterval);
+        Row(it, "Restart iCloud every (minutes, 0 = never) - waits for active downloads/copies to finish first", _restartInterval);
+        Row(it, "", _restartOnlyStuck);
         Row(it, "After restarting iCloud, wait (seconds)", _icloudSettle);
         Row(it, "", _watchdog);
         Row(it, "iCloud process names (comma separated)", _processNames);
@@ -508,6 +515,8 @@ public sealed class MainForm : Form
         _editJobs = c.Jobs.Select(j => j.Clone()).ToList();
         RefreshJobsEdit();
         _threads.Value = Math.Clamp(c.CopyThreads, 1, 32);
+        _downloadThreads.Value = Math.Clamp(c.DownloadThreads, 1, 32);
+        _downloadRetryMax.Value = Math.Clamp(c.DownloadRetryMaxMinutes, 1, 1440);
         _hydrationTimeout.Value = Math.Clamp(c.HydrationTimeoutMinutes, 1, 240);
         _settle.Value = Math.Clamp(c.FileSettleSeconds, 1, 600);
         _keepVersions.Checked = c.KeepVersions;
@@ -515,7 +524,8 @@ public sealed class MainForm : Form
         _retryMax.Value = Math.Clamp(c.RetryMaxDelayMinutes, 1, 1440);
         _retryAlert.Value = Math.Clamp(c.RetryAlertAfterAttempts, 1, 100);
         _syncInterval.Value = Math.Clamp(c.SyncIntervalMinutes, 5, 1440);
-        _restartICloud.Checked = c.RestartICloudOnSync;
+        _restartInterval.Value = Math.Clamp(c.ICloudRestartIntervalMinutes, 0, 1440);
+        _restartOnlyStuck.Checked = c.ICloudRestartOnlyWhenStuck;
         _icloudSettle.Value = Math.Clamp(c.ICloudSettleSeconds, 0, 600);
         _watchdog.Checked = c.ICloudWatchdog;
         _processNames.Text = string.Join(", ", c.ICloudProcessNames);
@@ -545,6 +555,8 @@ public sealed class MainForm : Form
         var c = Engine.Config.Clone();
         c.Jobs = _editJobs.Select(j => j.Clone()).ToList();
         c.CopyThreads = (int)_threads.Value;
+        c.DownloadThreads = (int)_downloadThreads.Value;
+        c.DownloadRetryMaxMinutes = (int)_downloadRetryMax.Value;
         c.HydrationTimeoutMinutes = (int)_hydrationTimeout.Value;
         c.FileSettleSeconds = (int)_settle.Value;
         c.KeepVersions = _keepVersions.Checked;
@@ -552,7 +564,8 @@ public sealed class MainForm : Form
         c.RetryMaxDelayMinutes = (int)_retryMax.Value;
         c.RetryAlertAfterAttempts = (int)_retryAlert.Value;
         c.SyncIntervalMinutes = (int)_syncInterval.Value;
-        c.RestartICloudOnSync = _restartICloud.Checked;
+        c.ICloudRestartIntervalMinutes = (int)_restartInterval.Value;
+        c.ICloudRestartOnlyWhenStuck = _restartOnlyStuck.Checked;
         c.ICloudSettleSeconds = (int)_icloudSettle.Value;
         c.ICloudWatchdog = _watchdog.Checked;
         c.ICloudProcessNames = _processNames.Text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)

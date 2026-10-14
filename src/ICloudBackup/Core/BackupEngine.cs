@@ -43,6 +43,8 @@ public sealed class BackupEngine : IDisposable
 
     private Channel<WorkItem> _queue = Channel.CreateUnbounded<WorkItem>();
     private readonly ConcurrentDictionary<string, byte> _queued = new();
+    private Channel<WorkItem> _downloadQueue = Channel.CreateUnbounded<WorkItem>();
+    private readonly ConcurrentDictionary<string, byte> _downloadQueued = new();
     private readonly ConcurrentDictionary<int, ActiveTransfer> _active = new();
     private readonly ConcurrentDictionary<string, (BackupJob Job, DateTime Due)> _pendingEvents = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTime> _pendingJobScans = new();
@@ -57,6 +59,9 @@ public sealed class BackupEngine : IDisposable
     private volatile bool _systemPaused;
     private volatile bool _icloudRestarting;
     private volatile string? _activity;
+    private volatile bool _providerDown;
+    private DateTime _lastRelaunchUtc = DateTime.MinValue;
+    private bool _icloudDownNotified;
 
     private long _sessionCopied, _sessionBytes, _sessionVerified, _sessionFailed;
 
@@ -66,6 +71,7 @@ public sealed class BackupEngine : IDisposable
     public bool Running => _cts != null;
     public DateTime? LastSync { get; private set; }
     public DateTime NextSync { get; private set; } = DateTime.Now;
+    public DateTime NextICloudRestart { get; private set; } = DateTime.MaxValue;
     public IntegrityProgress Integrity { get; private set; } = new();
 
     public long SessionCopied => Interlocked.Read(ref _sessionCopied);
@@ -73,13 +79,18 @@ public sealed class BackupEngine : IDisposable
     public long SessionVerified => Interlocked.Read(ref _sessionVerified);
     public long SessionFailed => Interlocked.Read(ref _sessionFailed);
     public int QueueLength => _queued.Count;
+    /// <summary>Files waiting for (or in the middle of) an iCloud download.</summary>
+    public int DownloadQueueLength => _downloadQueued.Count;
+    private const string DownloadingPhase = "Downloading from iCloud";
     public IReadOnlyList<ActiveTransfer> ActiveTransfers => _active.Values.OrderBy(a => a.Started).ToList();
     public bool IsNasOnline(BackupJob job) => !_nasOnline.TryGetValue(job.Id, out var v) || v;
     public StateDb Db => _db;
 
     public string Activity =>
         UserPaused ? "Paused" :
-        _activity ?? (_active.IsEmpty ? (_queued.IsEmpty ? "Idle - watching for changes" : "Waiting") : $"Copying ({_active.Count} active)");
+        _activity ?? (_active.IsEmpty
+            ? (_queued.IsEmpty && _downloadQueued.IsEmpty ? "Idle - watching for changes" : "Waiting")
+            : $"Working - {_active.Values.Count(a => a.Phase == DownloadingPhase)} downloading from iCloud, {_active.Values.Count(a => a.Phase != DownloadingPhase)} copying");
 
     public BackupEngine(AppConfig cfg, StateDb db)
     {
@@ -100,6 +111,8 @@ public sealed class BackupEngine : IDisposable
         var ct = _cts.Token;
         _queue = Channel.CreateUnbounded<WorkItem>();
         _queued.Clear();
+        _downloadQueue = Channel.CreateUnbounded<WorkItem>();
+        _downloadQueued.Clear();
         _pendingEvents.Clear();
         _nasOnline.Clear();
 
@@ -113,10 +126,19 @@ public sealed class BackupEngine : IDisposable
             var id = i;
             _tasks.Add(Task.Run(() => WorkerAsync(id, ct)));
         }
+        var downloadThreads = Math.Clamp(_cfg.DownloadThreads, 1, 32);
+        for (var i = 0; i < downloadThreads; i++)
+        {
+            var id = 1000 + i; // separate key range in _active
+            _tasks.Add(Task.Run(() => DownloadWorkerAsync(id, ct)));
+        }
         _tasks.Add(Task.Run(() => SchedulerAsync(ct)));
         NextSync = DateTime.Now;
+        NextICloudRestart = _cfg.ICloudRestartIntervalMinutes > 0 ? DateTime.Now.AddMinutes(_cfg.ICloudRestartIntervalMinutes) : DateTime.MaxValue;
 
-        Log.Info($"Backup engine started - {EnabledJobs.Count()} job(s), {threads} copy thread(s), sync every {_cfg.SyncIntervalMinutes} min");
+        Log.Info($"Backup engine started - {EnabledJobs.Count()} job(s), {threads} copy thread(s), {downloadThreads} download thread(s), " +
+                 $"rescan every {_cfg.SyncIntervalMinutes} min, " +
+                 (_cfg.ICloudRestartIntervalMinutes > 0 ? $"iCloud restart every {_cfg.ICloudRestartIntervalMinutes} min" : "iCloud restarts off"));
     }
 
     public async Task StopAsync()
@@ -126,6 +148,7 @@ public sealed class BackupEngine : IDisposable
         _cts.Cancel();
         _integrityCts?.Cancel();
         _queue.Writer.TryComplete();
+        _downloadQueue.Writer.TryComplete();
         foreach (var w in _watchers) w.Dispose();
         _watchers.Clear();
         try { await Task.WhenAll(_tasks).WaitAsync(TimeSpan.FromSeconds(30)); }
@@ -133,6 +156,7 @@ public sealed class BackupEngine : IDisposable
         _tasks.Clear();
         _active.Clear();
         _queued.Clear();
+        _downloadQueued.Clear();
         _cts.Dispose();
         _cts = null;
         _activity = null;
@@ -244,18 +268,16 @@ public sealed class BackupEngine : IDisposable
             return;
         }
 
-        var transfer = new ActiveTransfer { Job = job.Name, Rel = rel, Size = src.Size };
-        _active[workerId] = transfer;
-
-        // 1. Make sure the file is actually on this disk, not just in iCloud.
+        // 1. Still only in iCloud? Hand it to the download workers; they queue it back here once it's on disk.
+        //    Copy threads never sit waiting on iCloud.
         if (CloudFiles.IsPlaceholder(src.Attributes))
         {
-            transfer.Phase = "Downloading from iCloud";
-            await CloudFiles.HydrateAsync(src.FullPath, TimeSpan.FromMinutes(Math.Max(1, cfg.HydrationTimeoutMinutes)), ct);
-            fi.Refresh();
-            src = src with { Size = fi.Length, Mtime = fi.LastWriteTimeUtc.Ticks, Attributes = fi.Attributes };
-            transfer.Size = src.Size;
+            RequestDownload(item);
+            return;
         }
+
+        var transfer = new ActiveTransfer { Job = job.Name, Rel = rel, Size = src.Size };
+        _active[workerId] = transfer;
 
         var dest = Path.Combine(job.DestinationPath, rel);
         var existed = File.Exists(dest);
@@ -297,6 +319,74 @@ public sealed class BackupEngine : IDisposable
         Log.Ok($"{(existed ? "Updated" : "Copied")} {job.Name}: {rel} ({FileOps.FormatBytes(src.Size)})");
     }
 
+    private void RequestDownload(WorkItem item)
+    {
+        if (_downloadQueued.TryAdd(item.Key, 0) && !_downloadQueue.Writer.TryWrite(item)) _downloadQueued.TryRemove(item.Key, out _);
+    }
+
+    /// <summary>Asks iCloud for one file at a time per thread and waits until it's fully on disk, then queues the copy.</summary>
+    private async Task DownloadWorkerAsync(int id, CancellationToken ct)
+    {
+        var reader = _downloadQueue.Reader;
+        try
+        {
+            while (await reader.WaitToReadAsync(ct))
+            {
+                await WaitWhilePausedAsync(ct);
+                if (!reader.TryRead(out var item)) continue;
+                // The key stays in _downloadQueued until the download finishes, so iCloud's own change events
+                // during the download don't queue the same file a second time.
+                try
+                {
+                    var fi = new FileInfo(item.FullPath);
+                    if (!fi.Exists) continue;
+                    if (CloudFiles.IsPlaceholder(fi.Attributes))
+                    {
+                        _active[id] = new ActiveTransfer { Job = item.Job.Name, Rel = item.Rel, Size = fi.Length, Phase = DownloadingPhase };
+                        var started = DateTime.Now;
+                        await CloudFiles.HydrateAsync(item.FullPath, TimeSpan.FromMinutes(Math.Max(1, _cfg.HydrationTimeoutMinutes)), ct);
+                        Log.Info($"Downloaded from iCloud in {DiscordNotifier.FormatSpan(DateTime.Now - started)}: {item.Job.Name}: {item.Rel} ({FileOps.FormatBytes(fi.Length)})");
+                    }
+                    Enqueue(item);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    if (ex is CloudDownloadException { ProviderNotRunning: true }) _providerDown = true;
+                    await HandleFailureAsync(item, ex);
+                }
+                finally
+                {
+                    _active.TryRemove(id, out _);
+                    _downloadQueued.TryRemove(item.Key, out _);
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            Log.Error($"Download worker {id} crashed", ex);
+        }
+    }
+
+    private int RetryDownloadFailuresNow()
+    {
+        var jobs = EnabledJobs.ToDictionary(j => j.Id);
+        var n = 0;
+        foreach (var rec in _db.GetFailed())
+        {
+            if (rec.LastError?.StartsWith(CloudFiles.DownloadErrorPrefix, StringComparison.Ordinal) != true) continue;
+            if (!jobs.TryGetValue(rec.Job, out var job)) continue;
+            _db.RetryNow(rec.Job, rec.Rel);
+            Enqueue(new WorkItem(job, Path.Combine(job.SourcePath, rec.Rel), rec.Rel, false));
+            n++;
+        }
+        return n;
+    }
+
     private async Task HandleFailureAsync(WorkItem item, Exception ex)
     {
         var job = item.Job;
@@ -327,7 +417,9 @@ public sealed class BackupEngine : IDisposable
             }
 
             var attempts = (_db.Get(job.Id, item.Rel)?.Attempts ?? 0) + 1;
-            var delay = TimeSpan.FromMinutes(Math.Min(Math.Max(1, cfg.RetryMaxDelayMinutes), Math.Pow(2, Math.Min(attempts - 1, 16))));
+            // Waiting on iCloud is usually temporary, so those retry on a shorter cap than other failures.
+            var cap = ex is CloudDownloadException ? Math.Min(cfg.DownloadRetryMaxMinutes, cfg.RetryMaxDelayMinutes) : cfg.RetryMaxDelayMinutes;
+            var delay = TimeSpan.FromMinutes(Math.Min(Math.Max(1, cap), Math.Pow(2, Math.Min(attempts - 1, 16))));
             attempts = _db.MarkFailed(job.Id, item.Rel, size, mtime, message,
                 DateTimeOffset.UtcNow.Add(delay).ToUnixTimeMilliseconds());
             Interlocked.Increment(ref _sessionFailed);
@@ -453,8 +545,9 @@ public sealed class BackupEngine : IDisposable
                 {
                     var reason = _syncReason;
                     _syncReason = "scheduled";
-                    _ = RunSyncAsync(reason, _cfg.RestartICloudOnSync);
+                    _ = RunSyncAsync(reason);
                 }
+                if (now >= NextICloudRestart) _ = RunICloudRestartAsync();
                 CheckIntegritySchedule(now);
                 CheckDailySummary(now);
 
@@ -528,19 +621,49 @@ public sealed class BackupEngine : IDisposable
         }
     }
 
+    /// <summary>
+    /// Relaunches iCloud only when it has stopped completely (no configured process running), or when downloads
+    /// report that iCloud's sync engine isn't connected. At most one attempt every 10 minutes. Individual iCloud
+    /// processes come and go on their own, so one of them missing is not treated as a crash.
+    /// </summary>
     private async Task WatchdogAsync(CancellationToken ct)
     {
         if (_icloudRestarting) return;
-        var dead = _icloud.FindDead();
-        if (dead.Count == 0) return;
+        var anyRunning = _icloud.AnyRunning();
+        var down = !anyRunning && _icloud.EverSeenRunning;
 
-        Log.Warn($"iCloud process(es) stopped: {string.Join(", ", dead)} - relaunching");
-        var launched = await _icloud.EnsureRunningAsync(dead, ct);
-        if (_cfg.NotifyICloudEvents)
+        if (!down && !_providerDown)
         {
+            if (_icloudDownNotified)
+            {
+                _icloudDownNotified = false;
+                Log.Ok("iCloud is running again");
+                if (_cfg.NotifyICloudEvents) Notifier.Send(":green_circle: **iCloud Backup** - iCloud is running again.");
+            }
+            return;
+        }
+        if (DateTime.UtcNow - _lastRelaunchUtc < TimeSpan.FromMinutes(10)) return;
+        _lastRelaunchUtc = DateTime.UtcNow;
+
+        if (!down && _providerDown)
+        {
+            // Processes are up but downloads say the sync engine isn't connected: schedule a clean restart
+            // (which waits for active work to finish) rather than killing anything here.
+            _providerDown = false;
+            Log.Warn("iCloud downloads report the sync engine isn't connected - scheduling an iCloud restart");
+            NextICloudRestart = DateTime.Now;
+            return;
+        }
+
+        _providerDown = false;
+        Log.Warn("iCloud isn't running - launching it");
+        var launched = await _icloud.EnsureRunningAsync(_cfg.ICloudProcessNames, ct);
+        if (_cfg.NotifyICloudEvents && !_icloudDownNotified)
+        {
+            _icloudDownNotified = true;
             Notifier.Send(launched.Count > 0
-                ? $":arrows_counterclockwise: **iCloud Backup** - iCloud ({string.Join(", ", dead)}) had stopped. Relaunched it."
-                : $":warning: **iCloud Backup** - iCloud ({string.Join(", ", dead)}) has stopped and could not be relaunched automatically. New files won't download until it's running.");
+                ? ":arrows_counterclockwise: **iCloud Backup** - iCloud had stopped. Relaunched it."
+                : ":warning: **iCloud Backup** - iCloud has stopped and could not be relaunched automatically. New files won't download until it's running.");
         }
     }
 
@@ -567,7 +690,7 @@ public sealed class BackupEngine : IDisposable
 
     // ------------------------------------------------------------------ sync
 
-    private async Task RunSyncAsync(string reason, bool restartICloud)
+    private async Task RunSyncAsync(string reason)
     {
         if (_cts == null || !_syncLock.Wait(0)) return;
         var ct = _cts.Token;
@@ -577,24 +700,7 @@ public sealed class BackupEngine : IDisposable
         {
             Log.Info($"Sync started ({reason})");
 
-            if (restartICloud)
-            {
-                _activity = "Waiting for active copies to finish before restarting iCloud";
-                _systemPaused = true;
-                var waitUntil = DateTime.UtcNow.AddMinutes(10);
-                while (!_active.IsEmpty && DateTime.UtcNow < waitUntil) await Task.Delay(1000, ct);
-
-                _activity = "Restarting iCloud to force a sync";
-                _icloudRestarting = true;
-                try { await _icloud.RestartAsync(ct); }
-                finally { _systemPaused = false; }
-
-                _activity = $"Waiting {_cfg.ICloudSettleSeconds}s for iCloud to settle";
-                await Task.Delay(TimeSpan.FromSeconds(Math.Max(0, _cfg.ICloudSettleSeconds)), ct);
-                _icloudRestarting = false;
-                _icloud.FindDead(); // refresh which processes are running
-            }
-            else if (!_icloud.AnyRunning())
+            if (!_icloud.AnyRunning())
             {
                 Log.Warn("No iCloud processes running - launching iCloud");
                 await _icloud.EnsureRunningAsync(_cfg.ICloudProcessNames, ct);
@@ -636,10 +742,78 @@ public sealed class BackupEngine : IDisposable
         }
         finally
         {
+            _activity = null;
+            NextSync = DateTime.Now.AddMinutes(Math.Max(5, _cfg.SyncIntervalMinutes));
+            _syncLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Restarts iCloud so it re-checks for changes and retries stuck downloads. Never interrupts work: new work is
+    /// held back, and the restart only happens once every active download and copy has finished. If that takes
+    /// too long the restart is skipped and tried again 5 minutes later.
+    /// </summary>
+    private async Task RunICloudRestartAsync()
+    {
+        if (_cts == null || !_syncLock.Wait(0)) return;
+        var ct = _cts.Token;
+        var cfg = _cfg;
+        NextICloudRestart = DateTime.MaxValue;
+        DateTime? retryAt = null;
+        try
+        {
+            var stuck = _downloadQueued.Count + _db.GetFailed().Count(r => r.LastError?.StartsWith(CloudFiles.DownloadErrorPrefix, StringComparison.Ordinal) == true);
+            if (cfg.ICloudRestartOnlyWhenStuck && stuck == 0)
+            {
+                Log.Debug("Scheduled iCloud restart skipped - nothing is waiting on iCloud");
+                return;
+            }
+
+            _activity = "Letting active downloads and copies finish before restarting iCloud";
+            _systemPaused = true;
+            var limit = TimeSpan.FromMinutes(Math.Max(30, cfg.HydrationTimeoutMinutes + 5));
+            var until = DateTime.UtcNow + limit;
+            while (DateTime.UtcNow < until)
+            {
+                while (!_active.IsEmpty && DateTime.UtcNow < until) await Task.Delay(1000, ct);
+                // A worker may have taken a file just as the pause was set; give it a moment to show up.
+                await Task.Delay(2000, ct);
+                if (_active.IsEmpty) break;
+            }
+            if (!_active.IsEmpty)
+            {
+                Log.Warn($"iCloud restart skipped - {_active.Count} download(s)/copy(s) still running after {limit.TotalMinutes:0} min. Trying again in 5 min.");
+                retryAt = DateTime.Now.AddMinutes(5);
+                return;
+            }
+
+            _activity = "Restarting iCloud";
+            _icloudRestarting = true;
+            Log.Info($"Restarting iCloud ({stuck} file(s) waiting on iCloud)");
+            await _icloud.RestartAsync(ct);
+
+            _activity = $"Waiting {cfg.ICloudSettleSeconds}s for iCloud to reconnect";
+            await Task.Delay(TimeSpan.FromSeconds(Math.Max(0, cfg.ICloudSettleSeconds)), ct);
+            _providerDown = false;
+
+            if (_icloud.AnyRunning()) Log.Ok("iCloud restarted");
+            else Log.Warn("iCloud processes not running after restart - the watchdog will keep trying");
+
+            var retried = RetryDownloadFailuresNow();
+            if (retried > 0) Log.Info($"Retrying {retried} file(s) that were waiting on iCloud");
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            Log.Error("iCloud restart failed", ex);
+        }
+        finally
+        {
             _icloudRestarting = false;
             _systemPaused = false;
             _activity = null;
-            NextSync = DateTime.Now.AddMinutes(Math.Max(5, _cfg.SyncIntervalMinutes));
+            NextICloudRestart = retryAt
+                ?? (cfg.ICloudRestartIntervalMinutes > 0 ? DateTime.Now.AddMinutes(cfg.ICloudRestartIntervalMinutes) : DateTime.MaxValue);
             _syncLock.Release();
         }
     }

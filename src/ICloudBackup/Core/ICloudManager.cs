@@ -8,25 +8,20 @@ public sealed class ICloudManager(Func<AppConfig> config)
 {
     private sealed record StartApp(string Name, string AppId);
 
-    private readonly HashSet<string> _seenRunning = new(StringComparer.OrdinalIgnoreCase);
     private List<StartApp>? _startApps;
 
     private IEnumerable<string> ProcessNames => config().ICloudProcessNames.Where(n => !string.IsNullOrWhiteSpace(n)).Select(n => n.Trim());
 
     public static bool IsRunning(string name) => Process.GetProcessesByName(name).Length > 0;
 
-    public bool AnyRunning() => ProcessNames.Any(IsRunning);
+    /// <summary>True once any iCloud process has been seen this session - so a machine without iCloud isn't nagged.</summary>
+    public bool EverSeenRunning { get; private set; }
 
-    /// <summary>Process names that were running earlier in this session but aren't now.</summary>
-    public List<string> FindDead()
+    public bool AnyRunning()
     {
-        var dead = new List<string>();
-        foreach (var name in ProcessNames)
-        {
-            if (IsRunning(name)) _seenRunning.Add(name);
-            else if (_seenRunning.Contains(name)) dead.Add(name);
-        }
-        return dead;
+        var running = ProcessNames.Any(IsRunning);
+        if (running) EverSeenRunning = true;
+        return running;
     }
 
     public async Task RestartAsync(CancellationToken ct)
