@@ -3,3 +3,6 @@ obj/
 publish/
 *.pdb
 .DS_Store
+
+# Personal settings and personal builds - never commit
+personal/

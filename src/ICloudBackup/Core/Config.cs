@@ -98,6 +98,10 @@ public sealed class AppConfig
 
     public static AppConfig CreateDefault()
     {
+        // Personal builds (-p:PersonalBuild=true) embed personal/defaults.json, which is git-ignored.
+        var personal = LoadEmbeddedDefaults();
+        if (personal != null) return personal;
+
         var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         return new AppConfig
         {
@@ -117,6 +121,22 @@ public sealed class AppConfig
                 },
             ]
         };
+    }
+
+    private static AppConfig? LoadEmbeddedDefaults()
+    {
+        try
+        {
+            using var stream = typeof(AppConfig).Assembly.GetManifestResourceStream("PersonalDefaults.json");
+            if (stream == null) return null;
+            var cfg = JsonSerializer.Deserialize<AppConfig>(stream);
+            return cfg is { Jobs.Count: > 0 } ? cfg : null;
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"Embedded personal defaults unreadable - using generic defaults: {ex.Message}");
+            return null;
+        }
     }
 
     public AppConfig Clone()

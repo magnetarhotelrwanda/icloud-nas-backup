@@ -26,6 +26,12 @@
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
   </PropertyGroup>
 
+  <!-- Personal build: dotnet publish -p:PersonalBuild=true embeds ../../personal/defaults.json (git-ignored)
+       as the first-run defaults. Normal builds never include it. -->
+  <ItemGroup Condition="'$(PersonalBuild)' == 'true' And Exists('$(MSBuildProjectDirectory)/../../personal/defaults.json')">
+    <EmbeddedResource Include="$(MSBuildProjectDirectory)/../../personal/defaults.json" LogicalName="PersonalDefaults.json" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.12" />
