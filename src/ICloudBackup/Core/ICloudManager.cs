@@ -12,6 +12,17 @@ public sealed class ICloudManager(Func<AppConfig> config)
 
     private IEnumerable<string> ProcessNames => config().ICloudProcessNames.Where(n => !string.IsNullOrWhiteSpace(n)).Select(n => n.Trim());
 
+    /// <summary>iCloud's main app (iCloudHome). It owns the other processes and stays open when they die.</summary>
+    private string? AppProcess => Clean(config().ICloudAppProcessName);
+
+    /// <summary>iCloud's sync engine (iCloudDrive) - provides both the iCloud Drive and iCloud Photos folders.</summary>
+    private string? SyncProcess => Clean(config().ICloudSyncProcessName);
+
+    private static string? Clean(string? name) => string.IsNullOrWhiteSpace(name) ? null : name.Trim();
+
+    private IEnumerable<string> AllNames => ProcessNames.Concat(new[] { AppProcess, SyncProcess }.OfType<string>())
+        .Distinct(StringComparer.OrdinalIgnoreCase);
+
     public static bool IsRunning(string name) => Process.GetProcessesByName(name).Length > 0;
 
     /// <summary>True once any iCloud process has been seen this session - so a machine without iCloud isn't nagged.</summary>
@@ -19,14 +30,46 @@ public sealed class ICloudManager(Func<AppConfig> config)
 
     public bool AnyRunning()
     {
-        var running = ProcessNames.Any(IsRunning);
+        var running = AllNames.Any(IsRunning);
         if (running) EverSeenRunning = true;
         return running;
     }
 
+    /// <summary>
+    /// True when iCloud's sync engine is running. Without it nothing new reaches the iCloud folders, even though
+    /// the iCloud app itself is still open. Falls back to "any iCloud process" when no sync process is configured.
+    /// </summary>
+    public bool SyncRunning()
+    {
+        var any = AnyRunning();
+        return SyncProcess is { } sync ? IsRunning(sync) : any;
+    }
+
     public async Task RestartAsync(CancellationToken ct)
     {
-        foreach (var name in ProcessNames)
+        StopAll();
+        await Task.Delay(TimeSpan.FromSeconds(5), ct);
+        await LaunchAsync(ct);
+    }
+
+    /// <summary>
+    /// Gets iCloud's sync engine running again. If the iCloud app is still open its Start-menu entry only brings
+    /// the existing window forward and the sync engine stays dead, so the app is stopped first and launched fresh.
+    /// </summary>
+    public async Task<bool> EnsureRunningAsync(CancellationToken ct)
+    {
+        if (SyncRunning()) return true;
+        if (AllNames.Any(IsRunning))
+        {
+            StopAll();
+            await Task.Delay(TimeSpan.FromSeconds(5), ct);
+        }
+        return await LaunchAsync(ct);
+    }
+
+    private void StopAll()
+    {
+        foreach (var name in AllNames)
         {
             foreach (var p in Process.GetProcessesByName(name))
             {
@@ -42,46 +85,31 @@ public sealed class ICloudManager(Func<AppConfig> config)
                 finally { p.Dispose(); }
             }
         }
-
-        await Task.Delay(TimeSpan.FromSeconds(5), ct);
-        await EnsureRunningAsync(ProcessNames.ToList(), ct);
     }
 
-    /// <summary>Launches any of the given processes that aren't running, via their Start-menu (Store) app entry.</summary>
-    public async Task<List<string>> EnsureRunningAsync(List<string> names, CancellationToken ct)
+    /// <summary>Launches iCloud via its Start-menu (Store) app entry.</summary>
+    private async Task<bool> LaunchAsync(CancellationToken ct)
     {
-        var launched = new List<string>();
-        var missing = names.Where(n => !IsRunning(n)).ToList();
-        if (missing.Count == 0) return launched;
-
         var apps = await GetStartAppsAsync(ct);
         if (apps.Count == 0)
         {
             Log.Warn("No iCloud apps found in the Start menu - relying on iCloud to restart itself.");
-            return launched;
+            return false;
         }
 
-        var launchedIds = new HashSet<string>();
-        foreach (var name in missing)
+        // The main "iCloud" entry starts the app, which starts the sync engine and the other processes.
+        var app = apps.FirstOrDefault(a => Normalize(a.Name) == "icloud") ?? apps[0];
+        try
         {
-            var key = Normalize(name);
-            var app = apps.FirstOrDefault(a => Normalize(a.Name).Contains(key))
-                      ?? apps.FirstOrDefault(a => key.Contains(Normalize(a.Name)) && Normalize(a.Name).Length > "icloud".Length)
-                      ?? apps.FirstOrDefault(a => Normalize(a.Name) == "icloud");
-            if (app == null || !launchedIds.Add(app.AppId)) continue;
-
-            try
-            {
-                Process.Start(new ProcessStartInfo("explorer.exe", $"shell:AppsFolder\\{app.AppId}") { UseShellExecute = false })?.Dispose();
-                Log.Info($"Launched {app.Name} ({app.AppId}) for {name}");
-                launched.Add(name);
-            }
-            catch (Exception ex)
-            {
-                Log.Warn($"Could not launch {app.Name}: {ex.Message}");
-            }
+            Process.Start(new ProcessStartInfo("explorer.exe", $"shell:AppsFolder\\{app.AppId}") { UseShellExecute = false })?.Dispose();
+            Log.Info($"Launched {app.Name} ({app.AppId})");
+            return true;
         }
-        return launched;
+        catch (Exception ex)
+        {
+            Log.Warn($"Could not launch {app.Name}: {ex.Message}");
+            return false;
+        }
     }
 
     private static string Normalize(string s) => new string(s.Where(char.IsLetterOrDigit).ToArray()).ToLowerInvariant();

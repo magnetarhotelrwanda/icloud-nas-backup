@@ -185,7 +185,7 @@ A file counts as changed when its **size or last-write time** differs from what 
 
 `RunSyncAsync` runs on startup, every `SyncIntervalMinutes` (default 60, minimum 5), on **Sync now**, and when the scheduler asks for one. It **does not restart iCloud**; restarts have their own timer (next section). Only one rescan, job rescan or iCloud restart runs at a time.
 
-1. If no iCloud process is running, launches iCloud.
+1. If no iCloud process is running at all, launches iCloud. (A stopped sync engine on its own is left to the watchdog, so iCloud isn't interrupted while it's starting up.)
 2. **For each enabled job** (`ScanJobAsync`):
    1. Walks the iCloud folder. It descends into every folder (including placeholder folders) and never skips hidden or system files, except names matching `ExcludePatterns`.
    2. Queues every file that is new, changed, previously deleted, or failed and past its retry time. Online-only files go on to the download queue from there.
@@ -201,7 +201,7 @@ A file counts as changed when its **size or last-write time** differs from what 
 1. If `ICloudRestartOnlyWhenStuck` is on and no file is waiting on an iCloud download, the restart is skipped.
 2. New downloads and copies are held back (nothing new is started).
 3. Waits until **every** active download and copy has finished, for up to `max(30, HydrationTimeoutMinutes + 5)` minutes. If work is still running after that, this restart is **skipped** and retried 5 minutes later. Nothing is killed mid-transfer.
-4. Kills the processes in `ICloudProcessNames`, waits 5 s, and relaunches any that didn't restart on their own via `explorer.exe shell:AppsFolder\<AppID>` (found with `Get-StartApps`).
+4. Kills the processes in `ICloudProcessNames` plus the iCloud app (`ICloudAppProcessName`, `iCloudHome`) and sync engine (`ICloudSyncProcessName`, `iCloudDrive`), waits 5 s, and launches iCloud via `explorer.exe shell:AppsFolder\<AppID>` (found with `Get-StartApps`). The app has to be stopped too: while `iCloudHome` is open, launching it only brings its window forward and doesn't restart the sync engine.
 5. Waits `ICloudSettleSeconds` (still holding new work), then resumes.
 6. Immediately retries every file whose last error was an iCloud download failure.
 
@@ -255,7 +255,7 @@ The scheduler ticks every 2 s:
 | NAS reachable | 30 s | `Directory.Exists(dest)` with a 15 s timeout. If the folder is missing but the drive or share root is reachable, the folder is created. Copying pauses while offline. Discord is told when the NAS goes offline and when it comes back; coming back also triggers a rescan. |
 | Watcher events | 2 s | Queues debounced files and runs pending job rescans. |
 | Due retries | 30 s | Queues failed files whose retry time has passed. |
-| iCloud watchdog | 60 s | Acts only when **none** of the processes in `ICloudProcessNames` is running (after iCloud was seen running at least once), or when a download reported that iCloud's sync engine isn't connected. A full stop → launches iCloud, and Discord is told once per outage and again when it recovers. Not connected → schedules a clean iCloud restart. At most one action every 10 minutes. Skipped during a deliberate restart. A single iCloud process coming and going on its own is normal and ignored. |
+| iCloud watchdog | 60 s | Acts when iCloud's sync engine (`ICloudSyncProcessName`, `iCloudDrive`) has been missing for 3 checks in a row (after iCloud was seen running at least once), or when a download reported that the sync engine isn't connected. Engine stopped → stops whatever is left of iCloud (including `iCloudHome`) and launches it fresh; Discord is told once per outage and again when it recovers. Not connected → schedules a clean iCloud restart. At most one action every 10 minutes. Skipped during a deliberate restart. Other iCloud processes such as `iCloudPhotos` come and go on their own and are ignored. |
 | Disk space | 10 min | Alerts once when free space on a source drive falls below `LowDiskSpaceGb`. The alert re-arms once free space is back above 110 % of the threshold. |
 | Rescan due | each tick | Starts the hourly rescan |
 | iCloud restart due | each tick | Starts the 15-minute iCloud restart |
@@ -344,10 +344,12 @@ All of these are editable in the **Settings** tab, which is the recommended way.
 | `DownloadRetryMaxMinutes` | 30 | Upper limit on the retry back-off for iCloud download failures |
 | `SyncIntervalMinutes` | 60 | Full rescan interval (minimum 5). Doesn't restart iCloud. |
 | `ICloudRestartIntervalMinutes` | 15 | Restart iCloud this often (0 = never). Waits for active downloads and copies to finish. |
-| `ICloudRestartOnlyWhenStuck` | false | Skip a scheduled restart when nothing is waiting on an iCloud download |
+| `ICloudRestartOnlyWhenStuck` | true | Skip a scheduled restart when nothing is waiting on an iCloud download |
 | `ICloudSettleSeconds` | 30 | Wait after restarting iCloud before resuming work |
-| `ICloudWatchdog` | true | Relaunch iCloud when it has stopped completely |
-| `ICloudProcessNames` | `iCloudDrive`, `iCloudPhotos` | Process names (without `.exe`) to restart and watch |
+| `ICloudWatchdog` | true | Relaunch iCloud when its sync engine has stopped |
+| `ICloudProcessNames` | `iCloudDrive`, `iCloudPhotos` | Process names (without `.exe`) to stop on a restart |
+| `ICloudAppProcessName` | `iCloudHome` | iCloud's main app. Stopped on a restart so relaunching starts it fresh. |
+| `ICloudSyncProcessName` | `iCloudDrive` | iCloud's sync engine. iCloud counts as stopped when this isn't running. |
 | `IntegrityCheckIntervalDays` | 7 | 0 turns off automatic checks |
 | `IntegrityCheckHour` | 3 | Local hour (0–23) when an automatic check may start |
 | `IntegrityRehashSource` | true | Re-hash iCloud files during the check. If false, the stored hash is trusted for unchanged files. |
@@ -549,6 +551,12 @@ src/ICloudBackup/
 ---
 
 ## Changelog
+
+**v1.2.0**
+- Fixed: new photos stopped arriving. iCloud restarts and the watchdog stopped `iCloudDrive`/`iCloudPhotos` but left the iCloud app (`iCloudHome`) open, so relaunching only brought its window forward and the sync engine stayed down. The app is now stopped too and launched fresh.
+- Fixed: the watchdog only acted when every iCloud process had stopped. It now acts when the sync engine (`ICloudSyncProcessName`) has been missing for 3 minutes, even if the app is still open.
+- Changed: `ICloudRestartOnlyWhenStuck` now defaults to on. Restarting every 15 minutes with nothing waiting killed `iCloudPhotos` while it was bringing in new photos. Existing installs keep their saved setting; tick it in Settings.
+- New: `ICloudAppProcessName` (default `iCloudHome`) and `ICloudSyncProcessName` (default `iCloudDrive`).
 
 **v1.1.0**
 - Fixed: iCloud downloads (`CfHydratePlaceholder`) and folder pinning (`CfSetPinState`) were opened without the `READ_DATA` access the API requires, so they always failed and fell back quietly.

@@ -61,10 +61,14 @@ public sealed class AppConfig
     /// <summary>Restart iCloud this often to make it pick up changes; 0 = never. Waits until nothing is downloading or copying.</summary>
     public int ICloudRestartIntervalMinutes { get; set; } = 15;
     /// <summary>Skip the scheduled restart when no files are waiting on an iCloud download.</summary>
-    public bool ICloudRestartOnlyWhenStuck { get; set; } = false;
+    public bool ICloudRestartOnlyWhenStuck { get; set; } = true;
     public int ICloudSettleSeconds { get; set; } = 30;
     public bool ICloudWatchdog { get; set; } = true;
     public List<string> ICloudProcessNames { get; set; } = ["iCloudDrive", "iCloudPhotos"];
+    /// <summary>iCloud's main app process. Stopped along with the others so relaunching starts it fresh.</summary>
+    public string ICloudAppProcessName { get; set; } = "iCloudHome";
+    /// <summary>iCloud's sync engine process. iCloud counts as down when this isn't running.</summary>
+    public string ICloudSyncProcessName { get; set; } = "iCloudDrive";
 
     // Integrity
     public int IntegrityCheckIntervalDays { get; set; } = 7;

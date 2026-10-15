@@ -50,6 +50,8 @@ public sealed class MainForm : Form
     private readonly NumericUpDown _icloudSettle = Num(0, 600);
     private readonly CheckBox _watchdog = Check("Relaunch iCloud automatically if it stops running");
     private readonly TextBox _processNames = new() { Width = 300 };
+    private readonly TextBox _appProcess = new() { Width = 160 };
+    private readonly TextBox _syncProcess = new() { Width = 160 };
     private readonly NumericUpDown _integrityDays = Num(0, 90);
     private readonly NumericUpDown _integrityHour = Num(0, 23);
     private readonly CheckBox _rehashSource = Check("Re-hash the iCloud copy too (slower, but checks both sides byte for byte)");
@@ -133,6 +135,7 @@ public sealed class MainForm : Form
 
     private static NumericUpDown Num(int min, int max) => new() { Minimum = min, Maximum = max, Width = 80 };
     private static CheckBox Check(string text) => new() { Text = text, AutoSize = true };
+    private static string StripExe(string name) => name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? name[..^4] : name;
 
     private static FlowLayoutPanel ButtonRow(params Control[] controls)
     {
@@ -410,6 +413,8 @@ public sealed class MainForm : Form
         Row(it, "After restarting iCloud, wait (seconds)", _icloudSettle);
         Row(it, "", _watchdog);
         Row(it, "iCloud process names (comma separated)", _processNames);
+        Row(it, "iCloud app process (stopped and relaunched with the others)", _appProcess);
+        Row(it, "iCloud sync engine process (iCloud counts as stopped when this isn't running)", _syncProcess);
         flow.Controls.Add(icloudBox);
 
         var integrityBox = Group("Integrity check (hashes every file in iCloud and on the NAS and compares them)", out var gt);
@@ -529,6 +534,8 @@ public sealed class MainForm : Form
         _icloudSettle.Value = Math.Clamp(c.ICloudSettleSeconds, 0, 600);
         _watchdog.Checked = c.ICloudWatchdog;
         _processNames.Text = string.Join(", ", c.ICloudProcessNames);
+        _appProcess.Text = c.ICloudAppProcessName;
+        _syncProcess.Text = c.ICloudSyncProcessName;
         _integrityDays.Value = Math.Clamp(c.IntegrityCheckIntervalDays, 0, 90);
         _integrityHour.Value = Math.Clamp(c.IntegrityCheckHour, 0, 23);
         _rehashSource.Checked = c.IntegrityRehashSource;
@@ -569,7 +576,9 @@ public sealed class MainForm : Form
         c.ICloudSettleSeconds = (int)_icloudSettle.Value;
         c.ICloudWatchdog = _watchdog.Checked;
         c.ICloudProcessNames = _processNames.Text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Select(n => n.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? n[..^4] : n).ToList();
+            .Select(StripExe).ToList();
+        c.ICloudAppProcessName = StripExe(_appProcess.Text.Trim());
+        c.ICloudSyncProcessName = StripExe(_syncProcess.Text.Trim());
         c.IntegrityCheckIntervalDays = (int)_integrityDays.Value;
         c.IntegrityCheckHour = (int)_integrityHour.Value;
         c.IntegrityRehashSource = _rehashSource.Checked;

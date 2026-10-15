@@ -62,6 +62,7 @@ public sealed class BackupEngine : IDisposable
     private volatile bool _providerDown;
     private DateTime _lastRelaunchUtc = DateTime.MinValue;
     private bool _icloudDownNotified;
+    private int _syncDownChecks;
 
     private long _sessionCopied, _sessionBytes, _sessionVerified, _sessionFailed;
 
@@ -622,26 +623,25 @@ public sealed class BackupEngine : IDisposable
     }
 
     /// <summary>
-    /// Relaunches iCloud only when it has stopped completely (no configured process running), or when downloads
-    /// report that iCloud's sync engine isn't connected. At most one attempt every 10 minutes. Individual iCloud
-    /// processes come and go on their own, so one of them missing is not treated as a crash.
+    /// Relaunches iCloud when its sync engine (ICloudSyncProcessName) has stopped, or when downloads report that
+    /// the sync engine isn't connected. The engine must be missing on three checks in a row (so iCloud starting
+    /// up isn't mistaken for a crash), and there's at most one attempt every 10 minutes. Other iCloud processes, such
+    /// as iCloudPhotos, come and go on their own and are ignored.
     /// </summary>
     private async Task WatchdogAsync(CancellationToken ct)
     {
         if (_icloudRestarting) return;
-        var anyRunning = _icloud.AnyRunning();
-        var down = !anyRunning && _icloud.EverSeenRunning;
+        var syncRunning = _icloud.SyncRunning();
+        _syncDownChecks = syncRunning ? 0 : _syncDownChecks + 1;
+        var down = !syncRunning && _icloud.EverSeenRunning && _syncDownChecks >= 3;
 
-        if (!down && !_providerDown)
+        if (syncRunning && _icloudDownNotified)
         {
-            if (_icloudDownNotified)
-            {
-                _icloudDownNotified = false;
-                Log.Ok("iCloud is running again");
-                if (_cfg.NotifyICloudEvents) Notifier.Send(":green_circle: **iCloud Backup** - iCloud is running again.");
-            }
-            return;
+            _icloudDownNotified = false;
+            Log.Ok("iCloud is running again");
+            if (_cfg.NotifyICloudEvents) Notifier.Send(":green_circle: **iCloud Backup** - iCloud is running again.");
         }
+        if (!down && !_providerDown) return;
         if (DateTime.UtcNow - _lastRelaunchUtc < TimeSpan.FromMinutes(10)) return;
         _lastRelaunchUtc = DateTime.UtcNow;
 
@@ -656,12 +656,12 @@ public sealed class BackupEngine : IDisposable
         }
 
         _providerDown = false;
-        Log.Warn("iCloud isn't running - launching it");
-        var launched = await _icloud.EnsureRunningAsync(_cfg.ICloudProcessNames, ct);
+        Log.Warn("iCloud's sync engine isn't running - relaunching iCloud");
+        var launched = await _icloud.EnsureRunningAsync(ct);
         if (_cfg.NotifyICloudEvents && !_icloudDownNotified)
         {
             _icloudDownNotified = true;
-            Notifier.Send(launched.Count > 0
+            Notifier.Send(launched
                 ? ":arrows_counterclockwise: **iCloud Backup** - iCloud had stopped. Relaunched it."
                 : ":warning: **iCloud Backup** - iCloud has stopped and could not be relaunched automatically. New files won't download until it's running.");
         }
@@ -700,10 +700,12 @@ public sealed class BackupEngine : IDisposable
         {
             Log.Info($"Sync started ({reason})");
 
+            // Only a full stop is handled here; iCloud may still be starting up (e.g. at login), so a missing
+            // sync engine alone is left to the watchdog, which waits for it to stay missing.
             if (!_icloud.AnyRunning())
             {
                 Log.Warn("No iCloud processes running - launching iCloud");
-                await _icloud.EnsureRunningAsync(_cfg.ICloudProcessNames, ct);
+                await _icloud.EnsureRunningAsync(ct);
             }
 
             var results = new List<(BackupJob Job, ScanResult Result)>();
@@ -790,14 +792,15 @@ public sealed class BackupEngine : IDisposable
             _activity = "Restarting iCloud";
             _icloudRestarting = true;
             Log.Info($"Restarting iCloud ({stuck} file(s) waiting on iCloud)");
+            _lastRelaunchUtc = DateTime.UtcNow;
             await _icloud.RestartAsync(ct);
 
             _activity = $"Waiting {cfg.ICloudSettleSeconds}s for iCloud to reconnect";
             await Task.Delay(TimeSpan.FromSeconds(Math.Max(0, cfg.ICloudSettleSeconds)), ct);
             _providerDown = false;
 
-            if (_icloud.AnyRunning()) Log.Ok("iCloud restarted");
-            else Log.Warn("iCloud processes not running after restart - the watchdog will keep trying");
+            if (_icloud.SyncRunning()) Log.Ok("iCloud restarted");
+            else Log.Warn("iCloud's sync engine isn't running after restart - the watchdog will keep trying");
 
             var retried = RetryDownloadFailuresNow();
             if (retried > 0) Log.Info($"Retrying {retried} file(s) that were waiting on iCloud");
